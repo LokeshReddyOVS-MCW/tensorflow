@@ -121,6 +121,66 @@ absl::InlinedVector<Axis, kMaxNumDimensions> CalculateResultDimensions(
 }
 
 // This will be replaced by tensor GetNdIndex function
+absl::InlinedVector<DimensionSize, kMaxNumDimensions> GenerateIndices(
+    int i, const absl::InlinedVector<DimensionSize, kMaxNumDimensions>& temp) {
+  int rank = temp.size();
+  absl::InlinedVector<DimensionSize, kMaxNumDimensions> indices(rank, 0);
+  int divisor = 1;
+  for (int64_t j = rank - 1; j >= 0; --j) {
+    indices[j] = (i / divisor) % temp[j];
+    divisor *= temp[j];
+  }
+  return indices;
+}
+
+// Transpose op implementation
+template <DataType data_type>
+absl::Status TransposeImpl(
+    const Tensor& operand,
+    const absl::InlinedVector<Axis, kMaxNumDimensions>& permutation,
+    Tensor& output) {
+  using StorageT = StorageType<data_type>;
+  if (permutation.size() != operand.Rank()) {
+    return absl::FailedPreconditionError(
+        "Rank of output and permutation doesn't match");
+  }
+  const StorageT* operand_buffer = operand.GetDataAs<data_type>();
+  StorageT* output_buffer = output.GetDataAs<data_type>();
+
+  int64_t operand_product = 1, output_product = 1;
+  for (int64_t i = 0; i < operand.Rank(); ++i) {
+    operand_product *= operand.shape().Dim(i);
+    output_product *= output.shape().Dim(i);
+  }
+
+  absl::InlinedVector<DimensionSize, kMaxNumDimensions> temp;
+  for (int64_t i = 0; i < operand.Rank(); ++i) {
+    temp.push_back(operand.shape().Dim(i));
+  }
+
+  for (size_t k = 0; k < operand.NumElements(); ++k) {
+    absl::InlinedVector<DimensionSize, kMaxNumDimensions> operand_index =
+        GenerateIndices(k, temp);
+    absl::InlinedVector<DimensionSize, kMaxNumDimensions> output_index(
+        output.Rank(), 0);
+    for (size_t d = 0; d < output.Rank(); ++d) {
+      output_index[d] = operand_index[permutation[d]];
+    }
+
+    int operand_element_index = 0, output_element_index = 0;
+    int64_t temp1 = 1, temp2 = 1;
+    for (int64_t i = 0; i < operand.Rank(); i++) {
+      temp1 *= operand.shape().Dim(i);
+      operand_element_index += operand_index[i] * (operand_product / temp1);
+      temp2 *= output.shape().Dim(i);
+      output_element_index += output_index[i] * (output_product / temp2);
+    }
+    output_buffer[output_element_index] = operand_buffer[operand_element_index];
+  }
+  return absl::OkStatus();
+}
+
+// This will be replaced by tensor GetNdIndex function
 void GenerateIndices(size_t index,
                      absl::InlinedVector<Axis, kMaxNumDimensions>& output_index,
                      const Tensor& output, size_t output_rank) {

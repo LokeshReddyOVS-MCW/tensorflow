@@ -30,10 +30,270 @@ limitations under the License.
 
 namespace shlo_ref {
 
+// Constraints Check
+absl::Status CheckParameters(ConvolutionOp& op, const Tensor& lhs,
+                             const Tensor& rhs, const Tensor& output) {
+  if (op.attributes.precision_configs.size() != 2) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: Size of precision_config must be two.");
+  }
+  Axis rank = lhs.Rank();
+  if (lhs.Rank() != rhs.Rank()) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: Rank of lhs and rhs must be same");
+  }
+  if (output.Rank() != lhs.Rank()) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: Rank of lhs and output must be same");
+  }
+  if (!lhs.IsQuantized()) {
+    SHLO_REF_RETURN_ON_ERROR(
+        CheckSameBaselineType(CheckCtx("Convolution"), lhs, rhs));
+    SHLO_REF_RETURN_ON_ERROR(
+        CheckSameBaselineType(CheckCtx("Convolution"), lhs, output));
+  }
+  if (op.attributes.window_strides.size() != rank - 2) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: Size of window_stride must be rank - 2");
+  }
+  if (!IsGreaterThanZero(op.attributes.window_strides)) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: The window_stride must be > 0");
+  }
+  if (op.attributes.padding.shape().Dim(0) != rank - 2 ||
+      op.attributes.padding.shape().Dim(1) != 2) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: Shape of padding must be [rank - 2, 2]");
+  }
+  if (op.attributes.lhs_dilation.size() != rank - 2) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: Shape of lhs_dilation must be rank - 2");
+  }
+  if (!IsGreaterThanZero(op.attributes.lhs_dilation)) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: The lhs_dilation must be > 0");
+  }
+  if (op.attributes.rhs_dilation.size() != rank - 2) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: Shape of rhs_dilation must be rank - 2");
+  }
+  if (!IsGreaterThanZero(op.attributes.rhs_dilation)) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: The rhs_dilation must be > 0");
+  }
+  if (lhs.shape().Dim(static_cast<Axis>(op.attributes.input_batch_dimension)) %
+          op.attributes.batch_group_count !=
+      0) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "Dim(lhs,input_batch_dimension) % batch_group_count = 0");
+  }
+  if (lhs.shape().Dim(
+          static_cast<Axis>(op.attributes.input_feature_dimension)) %
+          op.attributes.feature_group_count !=
+      0) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "Dim(lhs,input_feature_dimension) % (feature_group_count) = 0");
+  }
+  if (op.attributes.input_spatial_dimensions.size() != rank - 2) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "Size of input_spatial_dimensions must be rank - 2");
+  }
+  if (!IsUnique(op.attributes.input_batch_dimension,
+                op.attributes.input_feature_dimension,
+                op.attributes.input_spatial_dimensions)) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: The input_dimensions must be unique");
+  }
+  if (!IsInRange(op.attributes.input_batch_dimension,
+                 op.attributes.input_feature_dimension,
+                 op.attributes.input_spatial_dimensions, rank)) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: The input_dimensions must be >= 0 and < rank");
+  }
+  if (rhs.shape().Dim(
+          static_cast<Axis>(op.attributes.kernel_input_feature_dimension)) !=
+      lhs.shape().Dim(
+          static_cast<Axis>(op.attributes.input_feature_dimension)) /
+          op.attributes.feature_group_count) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "Dim(rhs,kernel_input_feature_dimension) = "
+        "Dim(lhs,input_feature_dimension) / feature_group_count");
+  }
+  if (rhs.shape().Dim(
+          static_cast<Axis>(op.attributes.kernel_output_feature_dimension)) %
+          op.attributes.batch_group_count !=
+      0) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "Dim(rhs,kernel_output_feature_dimension) % batch_group_count = 0");
+  }
+  if (rhs.shape().Dim(
+          static_cast<Axis>(op.attributes.kernel_output_feature_dimension)) %
+          op.attributes.feature_group_count !=
+      0) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "Dim(rhs,kernel_output_feature_dimension) % (feature_group_count) = 0");
+  }
+  if (op.attributes.kernel_spatial_dimensions.size() != rank - 2) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "Size of kernel_spatial_dimensions must be rank - 2");
+  }
+  if (!IsUnique(op.attributes.kernel_output_feature_dimension,
+                op.attributes.kernel_input_feature_dimension,
+                op.attributes.kernel_spatial_dimensions)) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "The kernel_dimensions must be unique");
+  }
+  if (!IsInRange(op.attributes.kernel_output_feature_dimension,
+                 op.attributes.kernel_input_feature_dimension,
+                 op.attributes.kernel_spatial_dimensions, rank)) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: The kernel_dimensions must be >= 0 and < rank");
+  }
+  if (op.attributes.output_spatial_dimensions.size() != rank - 2) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "Size of output_spatial_dimensions must be rank - 2");
+  }
+  if (!IsUnique(op.attributes.output_batch_dimension,
+                op.attributes.output_feature_dimension,
+                op.attributes.output_spatial_dimensions)) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "The output_dimensions must be unique");
+  }
+  if (!IsInRange(op.attributes.output_batch_dimension,
+                 op.attributes.output_feature_dimension,
+                 op.attributes.output_spatial_dimensions, rank)) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: The output_dimensions must be >= 0 and < rank");
+  }
+  if (op.attributes.feature_group_count <= 0) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: The feature_group_count must be > 0");
+  }
+  if (op.attributes.batch_group_count <= 0) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: The batch_group_count must be > 0");
+  }
+  if (op.attributes.batch_group_count != 1 &&
+      op.attributes.feature_group_count != 1) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: The batch_group_count == 1 or "
+        "feature_group_count == 1");
+  }
+  if (output.shape().Dim(
+          static_cast<Axis>(op.attributes.output_batch_dimension)) !=
+      lhs.shape().Dim(static_cast<Axis>(op.attributes.input_batch_dimension)) /
+          op.attributes.batch_group_count) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "output.shape().Dim(output_batch_dimension) == "
+        "lhs.shape().Dim(input_batch_dimension) / batch_group_count");
+  }
+  if (output.shape().Dim(
+          static_cast<Axis>(op.attributes.output_feature_dimension)) !=
+      rhs.shape().Dim(
+          static_cast<Axis>(op.attributes.kernel_output_feature_dimension))) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "output.shape().Dim(output_feature_dimension) == "
+        "rhs.shape().Dim(kernel_output_feature_dimension)");
+  }
+  if (!CheckOutputSpatial(op, lhs, rhs, output)) {
+    return absl::FailedPreconditionError(
+        "stablehlo.convolution: "
+        "output.shape().Dim(spatial_dim) is not properly set");
+  }
+  if (lhs.IsQuantized() || rhs.IsQuantized() || output.IsQuantized()) {
+    if (!(lhs.IsQuantized() && rhs.IsQuantized() && output.IsQuantized())) {
+      return absl::FailedPreconditionError(
+          "stablehlo.convolution: lhs.IsQuantized() && "
+          "rhs.IsQuantized() && output.IsQuantized()");
+    }
+    if (rhs.IsPerTensorQuantized()) {
+      if (!(output.IsPerTensorQuantized())) {
+        return absl::FailedPreconditionError(
+            "stablehlo.convolution: If is_per_tensor_quantized(rhs), then "
+            "is_per_tensor_quantized(output)");
+      }
+      // This will be replaced by Tensor::ExpressedType()
+      if (lhs.quantized_per_tensor_element_type().ExpressedType() !=
+          rhs.quantized_per_tensor_element_type().ExpressedType()) {
+        return absl::FailedPreconditionError(
+            "stablehlo.convolution: The expressed_type of lhs must be the same "
+            "as the expressed_type of rhs.");
+      }
+      if (output.quantized_per_tensor_element_type().ExpressedType() !=
+          rhs.quantized_per_tensor_element_type().ExpressedType()) {
+        return absl::FailedPreconditionError(
+            "stablehlo.convolution: The expressed_type of output must be the "
+            "same as the expressed_type of rhs.");
+      }
+    }
+    if (rhs.IsPerAxisQuantized()) {
+      if (rhs.quantized_per_axis_element_type().QuantizedDimension() !=
+          op.attributes.kernel_output_feature_dimension) {
+        return absl::FailedPreconditionError(
+            "stablehlo.convolution:  If is_per_axis_quantized(rhs), then "
+            "quantization_dimension(rhs) = "
+            "op.attributes.kernel_output_feature_dimension");
+      }
+      // This will be replaced by Tensor::ExpressedType()
+      if (lhs.quantized_per_tensor_element_type().ExpressedType() !=
+          rhs.quantized_per_axis_element_type().ExpressedType()) {
+        return absl::FailedPreconditionError(
+            "stablehlo.convolution: The expressed_type of lhs must be the same "
+            "as the expressed_type of rhs.");
+      }
+      if (output.IsPerTensorQuantized()) {
+        if (output.quantized_per_tensor_element_type().ExpressedType() !=
+            rhs.quantized_per_axis_element_type().ExpressedType()) {
+          return absl::FailedPreconditionError(
+              "stablehlo.convolution: The expressed_type of output must be the "
+              "same as the expressed_type of rhs.");
+        }
+      }
+    }
+    if (output.IsPerAxisQuantized()) {
+      if (output.quantized_per_axis_element_type().QuantizedDimension() !=
+          op.attributes.output_feature_dimension) {
+        return absl::FailedPreconditionError(
+            "stablehlo.convolution:  If "
+            "is_per_axis_quantized(output), then "
+            "quantization_dimension(output) = "
+            "op.attributes.output_feature_dimension");
+      }
+      // This will be replaced by Tensor::ExpressedType()
+      if (output.quantized_per_axis_element_type().ExpressedType() !=
+          rhs.quantized_per_axis_element_type().ExpressedType()) {
+        return absl::FailedPreconditionError(
+            "stablehlo.convolution: The expressed_type of output must be the "
+            "same as the expressed_type of rhs.");
+      }
+    }
+    if (lhs.StorageType() != rhs.StorageType()) {
+      return absl::FailedPreconditionError(
+          "stablehlo.convolution: "
+          "The storage_type of lhs must be the same as storage_type of rhs");
+    }
+  }
+  return absl::OkStatus();
+}
+
 template <DataType storage_type>
 absl::Status PrepareImpl(ConvolutionOp& op, const Tensor& lhs,
                          const Tensor& rhs, Tensor& output) {
   using StorageT = StorageType<storage_type>;
+
+  SHLO_REF_RETURN_ON_ERROR(CheckParameters(op, lhs, rhs, output));
 
   // preparing data for dot general
   absl::InlinedVector<DimensionSize, kMaxNumDimensions>

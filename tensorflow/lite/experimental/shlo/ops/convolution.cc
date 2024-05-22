@@ -567,6 +567,34 @@ absl::Status PrepareImpl(ConvolutionOp& op, const Tensor& lhs,
   }
   // split data prepare end
 
+  // quantized tensors prepare
+  if (lhs.IsQuantized()) {
+    op.lhs_dequantized_data =
+        std::vector<std::byte>(lhs.NumElements() * sizeof(StorageT));
+    const Shape lhs_dequantized_shape = lhs.shape();
+    Tensor lhs_dequantized{.type = TensorType{.shape = lhs_dequantized_shape,
+                                              .element_type = storage_type},
+                           .data = op.lhs_dequantized_data.data()};
+    op.rhs_dequantized_data =
+        std::vector<std::byte>(rhs.NumElements() * sizeof(StorageT));
+    const Shape rhs_dequantized_shape = rhs.shape();
+    Tensor rhs_dequantized{.type = TensorType{.shape = rhs_dequantized_shape,
+                                              .element_type = storage_type},
+                           .data = op.rhs_dequantized_data.data()};
+    op.output_dequantized_data =
+        std::vector<std::byte>(output.NumElements() * sizeof(StorageT));
+    const Shape output_dequantized_shape = output.shape();
+    Tensor output_dequantized{
+        .type = TensorType{.shape = output_dequantized_shape,
+                           .element_type = storage_type},
+        .data = op.output_dequantized_data.data()};
+
+    op.lhs_dequantized = std::move(lhs_dequantized);
+    op.rhs_dequantized = std::move(rhs_dequantized);
+    op.output_dequantized = std::move(output_dequantized);
+  }
+  // quantized tensors prepare end
+
   op.lhs_permutations = std::move(lhs_permutation_values);
   op.lhs_transposed = std::move(lhs_transposed);
   op.rhs_permutations = std::move(rhs_permutation_values);
@@ -736,18 +764,90 @@ absl::Status EvaluateImpl(ConvolutionOp& op, const Tensor& lhs,
   return absl::OkStatus();
 }
 
+template <DataType storage_type, DataType expressed_type>
+void DequantizeOpQuantizePerTensor(const Tensor& lhs, const Tensor& rhs,
+                                   Tensor& output, ConvolutionOp& op) {
+  using StorageT = StorageType<storage_type>;
+  using ExpressedT = StorageType<expressed_type>;
+
+  const StorageT* lhs_data = lhs.GetDataAs<storage_type>();
+  ExpressedT* lhs_dequantized_data =
+      op.lhs_dequantized.GetDataAs<expressed_type>();
+  const StorageT* rhs_data = rhs.GetDataAs<storage_type>();
+  ExpressedT* rhs_dequantized_data =
+      op.rhs_dequantized.GetDataAs<expressed_type>();
+  StorageT* output_data = output.GetDataAs<storage_type>();
+  ExpressedT* output_dequantized_data =
+      op.output_dequantized.GetDataAs<expressed_type>();
+
+  const DimensionSize lhs_num_elements = lhs.NumElements();
+  const StorageT lhs_zero_point =
+      lhs.quantized_per_tensor_element_type().ZeroPointAs<storage_type>();
+  const ExpressedT lhs_scale =
+      lhs.quantized_per_tensor_element_type().ScaleAs<expressed_type>();
+
+  for (DimensionSize i = 0; i < lhs_num_elements;
+       ++i, ++lhs_data, ++lhs_dequantized_data) {
+    *lhs_dequantized_data = Dequantize(*lhs_data, lhs_zero_point, lhs_scale);
+  }
+
+  const DimensionSize rhs_num_elements = rhs.NumElements();
+  const StorageT rhs_zero_point =
+      rhs.quantized_per_tensor_element_type().ZeroPointAs<storage_type>();
+  const ExpressedT rhs_scale =
+      rhs.quantized_per_tensor_element_type().ScaleAs<expressed_type>();
+
+  for (DimensionSize i = 0; i < rhs_num_elements;
+       ++i, ++rhs_data, ++rhs_dequantized_data) {
+    *rhs_dequantized_data = Dequantize(*rhs_data, rhs_zero_point, rhs_scale);
+  }
+
+  absl::Status status = Evaluate(op, op.lhs_dequantized, op.rhs_dequantized,
+                                 op.output_dequantized);
+
+  const DimensionSize output_num_elements = output.NumElements();
+  const StorageT output_zero_point =
+      output.quantized_per_tensor_element_type().ZeroPointAs<storage_type>();
+  const ExpressedT output_scale =
+      output.quantized_per_tensor_element_type().ScaleAs<expressed_type>();
+  const ExpressedT inv_scale = static_cast<ExpressedT>(1 / output_scale);
+
+  for (DimensionSize i = 0; i < output_num_elements;
+       ++i, ++output_dequantized_data, ++output_data) {
+    *output_data = Quantize<storage_type, expressed_type>(
+        *output_dequantized_data, output_zero_point, inv_scale);
+  }
+}
+
 ConvolutionOp Create(const ConvolutionOp::Attributes& attributes) {
   return {.attributes = attributes};
 }
 
 absl::Status Prepare(ConvolutionOp& op, const Tensor& lhs, const Tensor& rhs,
                      Tensor& output) {
-  DISPATCH_INT_FLOAT(PrepareImpl, lhs.StorageType(), op, lhs, rhs, output);
+  if (lhs.IsQuantized()) {
+    DISPATCH_INT_FLOAT(PrepareImpl,
+                       lhs.quantized_per_tensor_element_type().ExpressedType(),
+                       op, lhs, rhs, output);
+  }
+  if (!lhs.IsQuantized()) {
+    DISPATCH_INT_FLOAT(PrepareImpl, lhs.StorageType(), op, lhs, rhs, output);
+  }
 }
 
 absl::Status Evaluate(ConvolutionOp& op, const Tensor& lhs, const Tensor& rhs,
                       Tensor& output) {
-  DISPATCH_INT_FLOAT(EvaluateImpl, output.tensor_element_type(), op, lhs, rhs,
-                     output);
+  if (lhs.IsQuantized()) {
+    if (rhs.IsPerTensorQuantized()) {
+      DISPATCH_QUANTIZED(
+          DequantizeOpQuantizePerTensor,
+          output.quantized_per_tensor_element_type().StorageType(),
+          output.quantized_per_tensor_element_type().ExpressedType(), lhs, rhs,
+          output, op);
+    }
+  } else {
+    DISPATCH_INT_FLOAT(EvaluateImpl, output.tensor_element_type(), op, lhs, rhs,
+                       output);
+  }
 }
 }  // namespace shlo_ref
